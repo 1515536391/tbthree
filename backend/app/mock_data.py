@@ -1,0 +1,473 @@
+"""Mock dataset provider for TB3 MVP.
+
+Used when env TB3_MOCK_DATA=1 (or MOCK_DATA=1).
+
+This module returns deterministic, UI-friendly fake data matching the
+response shapes the Vue2 frontend expects.
+
+- Fixed-point scale: FP=1_000_000
+- Keys returned:
+  - /edges -> {"edge": [...]}
+  - /edges/{addr} -> {"edge": {...}}
+  - /tasks -> {"task": [...]}
+  - /tasks/{id} -> {"task": {...}}
+  - /governance/proposals -> {"governanceProposal": [...]}
+  - /logs -> {"logSummary": [...]}
+  - /tasks/{id}/logs -> {"items": [...], "total": N}
+  - /audit/tasks/{id}/logs -> {"taskId": id, "items": [...]}
+
+All numeric values are strings so the frontend can parseInt them.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import hashlib
+import json
+import os
+import random
+import sqlite3
+from functools import lru_cache
+from typing import Any, Dict, List, Tuple
+
+FP = 1_000_000
+
+
+def fake_cosmos_addr(label: str, seed: int | None = None, prefix: str = "cosmos") -> str:
+    """Generate a *bech32-ish* address string for demo/mock UI.
+
+    Notes:
+    - Not a real bech32 encoding; just produces strings that *look* like Cosmos addrs.
+    - Deterministic given (prefix, label, seed) so UI is stable across restarts.
+    """
+    bech32_charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+    base = f"{prefix}|{label}"
+    if seed is not None:
+        base += f"|{seed}"
+
+    # Expand hash material until we have enough chars.
+    h = hashlib.sha256(base.encode("utf-8")).digest()
+    out: list[str] = []
+    ctr = 0
+    while len(out) < 38:
+        for b in h:
+            out.append(bech32_charset[b % len(bech32_charset)])
+            if len(out) >= 38:
+                break
+        ctr += 1
+        h = hashlib.sha256(h + bytes([ctr & 0xFF])).digest()
+
+    return prefix + "1" + "".join(out[:38])
+
+
+
+
+def ensure_mock_db(
+    db_or_sessionlocal: Any = None,
+    *,
+    db_path: str | None = None,
+    seed: int | None = None,
+    addrs: Dict[str, str] | None = None,
+    **_: Any,
+) -> None:
+    """Backwards-compatible mock DB initializer.
+
+    Over time, different branches called this function differently:
+    - Old: ensure_mock_db("/path/to/tb3.db")
+    - New (from app.main mock startup): ensure_mock_db(SessionLocal, seed=..., addrs=...)
+
+    This helper accepts both forms and will:
+    1) Ensure the sqlite file exists (so environments that expect the file won't crash)
+    2) Best-effort create SQLAlchemy tables if we can discover a bound engine
+
+    NOTE: In TB3_MOCK_DATA mode, endpoints should use in-memory mock payloads;
+    the DB is mostly just to keep the app happy.
+    """
+
+    # Resolve db_path.
+    if isinstance(db_or_sessionlocal, str) and not db_path:
+        db_path = db_or_sessionlocal
+
+    if not db_path:
+        # Default to <repo>/backend/data/tb3.db (relative to this file).
+        base_dir = Path(__file__).resolve().parents[1]  # backend/
+        db_path = str(base_dir / "data" / "tb3.db")
+
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+    # Ensure the sqlite file exists.
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mock_marker (
+              id INTEGER PRIMARY KEY,
+              created_at INTEGER
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Best-effort: if a SQLAlchemy sessionmaker was provided, try to create tables.
+    try:
+        kw = getattr(db_or_sessionlocal, "kw", None) or {}
+        engine = kw.get("bind")
+        if engine is not None:
+            from .models import Base  # type: ignore
+
+            Base.metadata.create_all(bind=engine)
+    except Exception:
+        # Do not fail startup if models/engine aren't available.
+        pass
+
+
+def _fp_str(x: float) -> str:
+    return str(int(round(max(0.0, min(1.0, x)) * FP)))
+
+
+def _sha(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _pick_addr(addrs: Dict[str, str], key: str, tag: str) -> str:
+    v = (addrs or {}).get(key)
+    return v if v else fake_cosmos_addr(tag)
+
+
+def _dirichlet_fp(rnd: random.Random, k: int, alpha: float = 1.6) -> List[int]:
+    """Return k positive ints that sum to FP."""
+
+    xs = [rnd.random() ** (1.0 / alpha) for _ in range(k)]
+    s = sum(xs) or 1.0
+    raw = [x / s for x in xs]
+    ints = [int(round(v * FP)) for v in raw]
+    # fix rounding drift
+    drift = FP - sum(ints)
+    ints[0] += drift
+    # guard
+    ints = [max(0, i) for i in ints]
+    drift = FP - sum(ints)
+    ints[0] += drift
+    return ints
+
+
+def _make_edge(rnd: random.Random, addr: str, region: str, strength: float, status: str) -> Dict[str, Any]:
+    """strength in [0,1] -> higher score, higher b, higher hmm T."""
+
+    # score: concentrate around strength but keep some variance
+    score = max(0.05, min(0.98, strength + rnd.uniform(-0.06, 0.06)))
+
+    # subjective logic: b roughly tracks score; d inversely; u leftover
+    b = max(0.05, min(0.92, score * 0.85 + rnd.uniform(-0.04, 0.04)))
+    d = max(0.01, min(0.65, (1.0 - score) * 0.55 + rnd.uniform(-0.03, 0.03)))
+    u = max(0.02, 1.0 - b - d)
+    # renormalize to 1
+    s = b + d + u
+    b, d, u = b / s, d / s, u / s
+
+    # hmm: T/S/M sum to 1
+    # better nodes: higher T, lower M
+    t = max(0.08, min(0.88, score * 0.75 + 0.15 + rnd.uniform(-0.05, 0.05)))
+    m = max(0.02, min(0.70, (1.0 - score) * 0.55 + rnd.uniform(-0.04, 0.04)))
+    s_prob = max(0.03, 1.0 - t - m)
+    s2 = t + s_prob + m
+    t, s_prob, m = t / s2, s_prob / s2, m / s2
+
+    # penalty just for display
+    penalty = int(round((1.0 - score) * 12 + rnd.uniform(-0.5, 0.8)))
+    penalty = max(0, min(12, penalty))
+
+    return {
+        "edgeAddr": addr,
+        "region": region,
+        "status": status,
+        "score": _fp_str(score),
+        "b": _fp_str(b),
+        "d": _fp_str(d),
+        "u": _fp_str(u),
+        "hmmProbT": _fp_str(t),
+        "hmmProbS": _fp_str(s_prob),
+        "hmmProbM": _fp_str(m),
+        "priorityPenalty": str(penalty),
+    }
+
+
+def _make_task(
+    rnd: random.Random,
+    task_id: str,
+    vehicle_addr: str,
+    chosen_edge_addr: str,
+    region: str,
+    created_at: int,
+    status: str,
+    task_type: str,
+) -> Dict[str, Any]:
+    payload_hash = _sha(f"payload:{task_id}:{region}:{task_type}")
+    # result fields filled for finished tasks
+    done = status in {"COMPLETED", "FAILED", "VERIFIED"}
+    result_hash = _sha(f"result:{task_id}") if done else ""
+    result_sig = _sha(f"sig:{task_id}")[:96] if done else ""
+    verified = "true" if status == "VERIFIED" else "false"
+
+    return {
+        "taskId": task_id,
+        "vehicleAddr": vehicle_addr,
+        "chosenEdgeAddr": chosen_edge_addr,
+        "region": region,
+        "status": status,
+        "taskType": task_type,
+        "payloadHash": payload_hash,
+        "logHashes": "",
+        "resultHash": result_hash,
+        "resultSig": result_sig,
+        "verified": verified,
+        "createdAt": str(created_at),
+        "updatedAt": str(created_at + rnd.randint(30, 240)),
+    }
+
+
+def _make_log_summary(
+    rnd: random.Random,
+    task_id: str,
+    edge_addr: str,
+    stage: str,
+    ts: int,
+    strength: float,
+) -> Dict[str, Any]:
+    # higher strength => better latency, lower cpu/mem
+    base_lat = int(1200 - strength * 700 + rnd.randint(-80, 120))
+    base_cpu = int(2200 - strength * 1200 + rnd.randint(-120, 180))
+    base_mem = int(860 - strength * 420 + rnd.randint(-40, 60))
+    base_net = int(200 + rnd.randint(0, 260))
+
+    base_lat = max(60, base_lat)
+    base_cpu = max(80, base_cpu)
+    base_mem = max(96, base_mem)
+
+    log_hash = _sha(f"log:{task_id}:{edge_addr}:{stage}:{ts}")
+    result_hash = _sha(f"result:{task_id}")
+
+    return {
+        "taskId": task_id,
+        "edgeAddr": edge_addr,
+        "stage": stage,
+        "ts": str(ts),
+        "logHash": log_hash,
+        "resultHash": result_hash,
+        "cpuMs": str(base_cpu),
+        "memMbPeak": str(base_mem),
+        "latencyMs": str(base_lat),
+        "netKb": str(base_net),
+    }
+
+
+def _make_audit_items(rnd: random.Random, task_id: str, chain_logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for i, l in enumerate(chain_logs):
+        # make ~20% mismatches for UI richness
+        mismatch = (i % 5 == 4)
+        chain_hash = l["logHash"]
+        db_hash = chain_hash if not mismatch else _sha(chain_hash + ":db")
+
+        items.append(
+            {
+                "stage": l.get("stage"),
+                "ts": l.get("ts"),
+                "logHash": chain_hash,
+                "dbLogHash": db_hash,
+                "match": not mismatch,
+                "txHash": _sha(f"tx:{task_id}:{i}")[:64],
+                "height": 1000 + i,
+                "detail": {
+                    "taskId": task_id,
+                    "edgeAddr": l.get("edgeAddr"),
+                    "stage": l.get("stage"),
+                    "metrics": {
+                        "cpuMs": l.get("cpuMs"),
+                        "memMbPeak": l.get("memMbPeak"),
+                        "latencyMs": l.get("latencyMs"),
+                        "netKb": l.get("netKb"),
+                    },
+                    "note": "mock detail",
+                },
+            }
+        )
+    return items
+
+
+def _key(seed: int, addrs: Dict[str, str]) -> Tuple[int, Tuple[Tuple[str, str], ...]]:
+    return int(seed), tuple(sorted((addrs or {}).items()))
+
+
+@lru_cache(maxsize=32)
+def _dataset_cached(seed: int, addrs_items: Tuple[Tuple[str, str], ...]) -> Dict[str, Any]:
+    addrs = dict(addrs_items)
+    rnd = random.Random(seed)
+
+    admin = _pick_addr(addrs, "admin", "admin")
+    cloud = _pick_addr(addrs, "cloud", "cloud")
+    vehicle1 = _pick_addr(addrs, "vehicle1", "vehicle1")
+
+    edge1 = _pick_addr(addrs, "edge1", "edge1")
+    edge2 = _pick_addr(addrs, "edge2", "edge2")
+    edge3 = _pick_addr(addrs, "edge3", "edge3")
+
+    # strengths decide look & derived metrics
+    strengths = {
+        edge1: 0.82,
+        edge2: 0.56,
+        edge3: 0.22,
+    }
+
+    edges: List[Dict[str, Any]] = [
+        _make_edge(rnd, edge1, "A", strengths[edge1], "ACTIVE"),
+        _make_edge(rnd, edge2, "B", strengths[edge2], "ACTIVE"),
+        _make_edge(rnd, edge3, "C", strengths[edge3], "ACTIVE"),
+    ]
+
+    # proposals: make 2 pending + 1 approved
+    proposals: List[Dict[str, Any]] = [
+        {
+            "proposalId": "p-0001",
+            "edgeAddr": edge3,
+            "action": "TASK_FREEZE",
+            "status": "PENDING",
+            "reason": "score below threshold 0.300",
+            "adminAddr": admin,
+            "createdAt": "0",
+        },
+        {
+            "proposalId": "p-0002",
+            "edgeAddr": edge2,
+            "action": "WEIGHT_DOWN",
+            "status": "PENDING",
+            "reason": "abnormal latency spike",
+            "adminAddr": admin,
+            "createdAt": "0",
+        },
+        {
+            "proposalId": "p-0003",
+            "edgeAddr": edge1,
+            "action": "NONE",
+            "status": "APPROVED",
+            "reason": "stable and healthy",
+            "adminAddr": admin,
+            "createdAt": "0",
+        },
+    ]
+
+    now = 1_767_428_000  # stable-ish fake timestamp
+
+    # tasks
+    statuses = ["CREATED", "RUNNING", "COMPLETED", "VERIFIED", "FAILED"]
+    task_types = ["default", "perception", "planning"]
+
+    tasks: List[Dict[str, Any]] = []
+    task_strength_by_id: Dict[str, float] = {}
+
+    regions = ["A", "B", "C"]
+    edge_by_region = {"A": edge1, "B": edge2, "C": edge3}
+
+    idx = 1
+    for r in regions:
+        for _ in range(8):
+            task_id = f"demo-{r}-{idx:04d}"
+            idx += 1
+            chosen = edge_by_region[r]
+            status = statuses[(idx + rnd.randint(0, 2)) % len(statuses)]
+            task_type = task_types[(idx + rnd.randint(0, 2)) % len(task_types)]
+            created_at = now - rnd.randint(0, 7200)
+            tasks.append(_make_task(rnd, task_id, vehicle1, chosen, r, created_at, status, task_type))
+            task_strength_by_id[task_id] = strengths[chosen]
+
+    # logs
+    log_summaries: List[Dict[str, Any]] = []
+    logs_by_task: Dict[str, List[Dict[str, Any]]] = {}
+    audit_by_task: Dict[str, List[Dict[str, Any]]] = {}
+
+    stages = ["UPLOAD", "EXEC", "VERIFY"]
+
+    for t in tasks:
+        tid = t["taskId"]
+        eaddr = t["chosenEdgeAddr"]
+        strength = task_strength_by_id.get(tid, 0.5)
+        base_ts = int(t["createdAt"]) + 30
+        per_task: List[Dict[str, Any]] = []
+        for j, stage in enumerate(stages):
+            ts = base_ts + j * rnd.randint(25, 80)
+            per_task.append(_make_log_summary(rnd, tid, eaddr, stage, ts, strength))
+        logs_by_task[tid] = per_task
+        log_summaries.extend(per_task)
+        audit_by_task[tid] = _make_audit_items(rnd, tid, per_task)
+
+    return {
+        "addrs": {"admin": admin, "cloud": cloud, "vehicle1": vehicle1, "edge1": edge1, "edge2": edge2, "edge3": edge3},
+        "edges": edges,
+        "tasks": tasks,
+        "proposals": proposals,
+        "log_summaries": log_summaries,
+        "logs_by_task": logs_by_task,
+        "audit_by_task": audit_by_task,
+    }
+
+
+def build_mock_dataset(seed: int, addrs: Dict[str, str]) -> Dict[str, Any]:
+    """Public dataset builder."""
+
+    s, items = _key(seed, addrs)
+    return _dataset_cached(s, items)
+
+
+# ------------------- exported helpers used by app.main -------------------
+
+
+def mock_list_edges(seed: int, addrs: Dict[str, str]) -> Dict[str, Any]:
+    ds = build_mock_dataset(seed, addrs)
+    return {"edge": ds["edges"]}
+
+
+def mock_show_edge(edge_addr: str, seed: int, addrs: Dict[str, str]) -> Dict[str, Any]:
+    ds = build_mock_dataset(seed, addrs)
+    for e in ds["edges"]:
+        if e.get("edgeAddr") == edge_addr:
+            return {"edge": e}
+    # return empty-ish object to avoid frontend crash
+    return {"edge": {"edgeAddr": edge_addr, "region": "-", "status": "UNKNOWN", "score": "0", "b": "0", "d": "0", "u": str(FP), "hmmProbT": "0", "hmmProbS": "0", "hmmProbM": str(FP), "priorityPenalty": "0"}}
+
+
+def mock_list_tasks(seed: int, addrs: Dict[str, str]) -> Dict[str, Any]:
+    ds = build_mock_dataset(seed, addrs)
+    return {"task": ds["tasks"]}
+
+
+def mock_show_task(task_id: str, seed: int, addrs: Dict[str, str]) -> Dict[str, Any]:
+    ds = build_mock_dataset(seed, addrs)
+    for t in ds["tasks"]:
+        if t.get("taskId") == task_id:
+            return {"task": t}
+    return {"task": {"taskId": task_id, "status": "UNKNOWN"}}
+
+
+def mock_list_proposals(seed: int, addrs: Dict[str, str]) -> Dict[str, Any]:
+    ds = build_mock_dataset(seed, addrs)
+    return {"governanceProposal": ds["proposals"]}
+
+
+def mock_list_log_summaries(seed: int, addrs: Dict[str, str]) -> Dict[str, Any]:
+    ds = build_mock_dataset(seed, addrs)
+    return {"logSummary": ds["log_summaries"]}
+
+
+def mock_logs_by_task(task_id: str, seed: int, addrs: Dict[str, str]) -> Dict[str, Any]:
+    ds = build_mock_dataset(seed, addrs)
+    items = ds["logs_by_task"].get(task_id, [])
+    return {"items": items, "total": len(items)}
+
+
+def mock_audit_task_logs(task_id: str, seed: int, addrs: Dict[str, str]) -> Dict[str, Any]:
+    ds = build_mock_dataset(seed, addrs)
+    items = ds["audit_by_task"].get(task_id, [])
+    return {"taskId": task_id, "items": items}

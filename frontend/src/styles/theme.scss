@@ -1,0 +1,38 @@
+// Global theme variables (dark cyber style)
+
+$bg0: #0b1020;
+$bg1: #0f1630;
+$card: rgba(255, 255, 255, 0.06);
+$card2: rgba(255, 255, 255, 0.08);
+$stroke: rgba(255, 255, 255, 0.12);
+$text: rgba(255, 255, 255, 0.86);
+$text2: rgba(255, 255, 255, 0.6);
+
+$radius: 14px;
+
+@mixin glass-card {
+  background: $card;
+  border: 1px solid $stroke;
+  border-radius: $radius;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.35);
+  backdrop-filter: blur(10px);
+}
+
+@mixin neon-border {
+  position: relative;
+  &::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: $radius;
+    padding: 1px;
+    background: linear-gradient(135deg, rgba(0, 255, 255, 0.7), rgba(255, 0, 255, 0.5), rgba(0, 255, 153, 0.6));
+    -webkit-mask:
+      linear-gradient(#fff 0 0) content-box,
+      linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+    opacity: 0.55;
+  }
+}
