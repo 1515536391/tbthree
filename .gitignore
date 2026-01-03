@@ -42,3 +42,8 @@ backend/data/*.db
 backend/data/*.sqlite*
 backend/data/*.json
 backend/data/.auto_demo_seed_done.json
+
+# ---- local archives / fixpacks ----
+*.tgz
+README_FIXPACK_*.txt
+READMEgit.md
